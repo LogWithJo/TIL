@@ -1,71 +1,89 @@
 <!-- category: tanstack-query | slug: optimistic-updates-cancel-and-snapshot -->
+# TIL: Optimistic updates: cancel, snapshot, write, roll back, then invalidate
 
-# TIL: Optimistic updates, cancel first, then write, and keep a snapshot
-
-**Date:** 2026-11-19
-**Covered in this session:** onMutate + cancelQueries, setQueryData, invalidation basics, snapshot/context (explained, not yet practiced)
-**Not covered yet:** onError rollback, onSettled invalidation in a full flow, create/update/delete, concurrent mutations
+**Date:** 2026-11-22
+**Covered in this session:** onMutate + cancelQueries, snapshot with getQueryData, optimistic write with setQueryData, onError rollback, onSettled invalidation, a full toggle-todo mutation
+**Not covered yet:** create/update/delete patterns (temp IDs, list vs detail caches), concurrent mutations
+**Still open:** why `onError` calls `cancelQueries` before restoring the snapshot
 
 ## Core idea
-
-An optimistic update shows the success state in the UI immediately, before the server replies. If the server fails, the UI has to be put back. This only works if `onMutate` is written in the right order.
+An optimistic update shows the success state in the UI immediately, before the server replies. If the server fails, the UI has to be put back. That works only if `onMutate` does its steps in the right order and hands a snapshot to `onError`.
 
 ## What I learned
 
-### 1. Why `cancelQueries` comes first
+### 1. The `onMutate` order: cancel, snapshot, write, return
+```ts
+onMutate: async () => {
+  await queryClient.cancelQueries({ queryKey: ['todos'] })      // 1. stop in-flight GETs
+  const oldValues = queryClient.getQueryData(['todos'])         // 2. snapshot BEFORE the write
+  queryClient.setQueryData(['todos'], (oldData) => { /* 3. write */ })
+  return { oldValues }                                          // 4. becomes `context`
+},
+```
+- A background GET can be in flight when the user clicks. It carries stale data and would overwrite the optimistic write if it landed afterwards.
+- `cancelQueries` stops that GET from writing to the cache. It does not touch the mutation request, which is a separate request sent after `onMutate`.
+- If `cancelQueries` runs *after* `setQueryData`, the cancel reverts the query to its pre-fetch state and erases the optimistic write.
+- `getQueryData` reads the cache synchronously with no request. If it runs after `setQueryData`, the snapshot already contains the optimistic value, so the rollback restores nothing.
 
-- A background GET (refetch) can be in flight when the user clicks. The server read its data _before_ it knew about the click, so the response is stale.
-- If that response arrives after `setQueryData`, it overwrites the optimistic write and the checkbox flips back.
-- Refetches can start without any user action: window focus, reconnect, component mount, `refetchInterval`, or another mutation's invalidation.
-- `cancelQueries` stops that in-flight GET from writing into the cache. It does **not** touch the mutation request, which is a separate request sent after `onMutate` finishes.
+### 2. `onError` rollback with `context`
+```ts
+onError: (_error, _variables, context) => {
+  queryClient.setQueryData(['todos'], context?.oldValues)
+},
+```
+- `context` is whatever `onMutate` returned, handed to `onError` and `onSettled` as the third argument.
+- `context` is the wrapper object `{ oldValues }`, so I restore `context.oldValues`, not `context`.
+- A saved copy beats refetching alone: the rollback is instant, it works when the network or server is down, and it restores the exact previous state.
+- `setQueryData` only edits the local cache and sends no request. That is why a rollback is needed when the server fails.
 
-### 2. Order matters: cancel, then set
+### 3. Invalidate in `onSettled`
+```ts
+onSettled: () => {
+  queryClient.invalidateQueries({ queryKey: ['todos'] })
+},
+```
+- `onSettled` runs on both success and failure, and both can leave the cache different from the server.
+- After a failure, the cache only holds my saved copy, which may be out of date.
+- After a success, the optimistic write was a guess. The server may have changed something (a teammate's rename, `updatedAt`, a server-formatted value).
+- `invalidateQueries` marks the query stale and refetches it right away if a component is using it. It deletes nothing, and the old data stays on screen during the refetch.
 
-```js
-onMutate: async (newTodo) => {
-  await queryClient.cancelQueries({ queryKey: ['todos'] })
-  // snapshot goes here (see Gotchas / next steps)
-  queryClient.setQueryData(['todos'], (old) => /* return the new todos */)
+### 4. Write the update in place, keep the order
+```ts
+const updated = oldData.map((todo) =>
+  todo.id === noteid ? { ...todo, check: !todo.check } : todo,
+)
+```
+- Filtering out the todo and appending the changed one moves it to the bottom, then the refetch moves it back. That is a visible flicker.
+- `map` keeps every item in position and changes only the match. Spreading `...todo` avoids mutating the cached object.
+- Editing in place is better than copying the server's sort rules to the client, because those rules can drift from the backend.
+
+### 5. Guard against an empty cache
+```ts
+(oldData: Todo[] | undefined) => {
+  if (!oldData) return undefined
+  // ...
 }
 ```
+- A missing cache entry gives `undefined`, not `null`.
+- Returning `undefined` from the updater leaves the cache unchanged, so the guard is safe.
+- It skips the cache write only. `onMutate` still runs on and returns `{ oldValues }`, which is `undefined` here.
 
-- `cancelQueries` returns a promise, so it is awaited.
-- If you do `setQueryData` first and `cancelQueries` second, the cancel reverts the query to its pre-fetch state and **erases the optimistic write**. The user sees the checkbox flip back with no error.
-
-### 3. `setQueryData`
-
-- It edits only the local cache. It sends **no request**.
-- Nothing tells the cache to undo the edit if the server fails, which is why a rollback is needed.
-
-### 4. Snapshot and `context`
-
-- `getQueryData(key)` reads the cached value synchronously, with no request.
-- Whatever `onMutate` **returns** is passed to `onError` and `onSettled` as the third argument, `context`.
-- If `onMutate` returns nothing, `context` is `undefined` and `onError` has nothing to restore.
-- A saved copy beats refetching alone: the rollback is instant, it works offline or when the server is down, and it restores the exact previous state. The refetch in `onSettled` is still needed to end up in sync with the server.
-
-### 5. Invalidation and loading flags
-
-- `invalidateQueries` marks matching queries stale. It does **not** delete cached data.
-- If a component is using the query, it refetches right away. If nothing is using it, it refetches the next time something does.
-- During the refetch the component keeps showing the old data, because the query holds its last data separately from its fetch status.
+### 6. Loading flags
 - `isLoading` is true only when fetching with no data yet (first load). `isFetching` is true for any request in flight, including background refetches.
+- The query keeps its data and its status separately, which is why old data stays visible during a refetch.
 
 ## Gotchas (misconceptions I hit)
-
-- **`invalidateQueries` is not `cancelQueries`.** I mixed them up several times. Invalidate marks stale and triggers a refetch. Cancel stops in-flight GETs and starts nothing.
-- **`invalidateQueries` does not remove cached data.** I first said the cache "removes" it, then contradicted myself. The old data stays visible during the refetch.
-- **`cancelQueries` does not "clean up" earlier `setQueryData` changes.** It only reverts a query that has a request in flight, back to the state it had when that request started. With nothing in flight, it does nothing to the data.
-- **`cancelQueries` rejects nothing and is not tied to invalidation.** It cancels any in-flight GET for that key, whatever started it. The cancelled query keeps its existing data and does not go into an error state.
-- **`setQueryData` really is local-only.** I thought "no server request" was impossible. That is exactly what it does.
-- **`setQueryData` resets the freshness timer.** The optimistic data counts as fresh for the whole `staleTime`, so wrong data can look fresh. I still need to work out the fix.
-- **Optimistic data is a guess, not 100% synced.** That is why a refetch at the end is needed. An error also does not trigger a refetch by itself; I have to write the invalidation.
+- **`invalidateQueries` is not `cancelQueries`.** I mixed them up many times, and even tried to get the old data with `cancelQueries`. Invalidate marks stale and triggers a refetch. Cancel stops in-flight GETs and starts nothing.
+- **`invalidateQueries` does not remove cached data.** I first said the cache "removes" it and contradicted myself later.
+- **`invalidateQueries` does refetch right away** when a component is using the query. I thought it only waited for the next use.
+- **`cancelQueries` does not clean up earlier `setQueryData` changes.** It only reverts a query that has a request in flight, to the state it had when that request started. With nothing in flight, it does nothing to the data. It is also not tied to invalidation: it cancels any in-flight GET for that key.
 - **Two different requests:** the background GET (cancelled) and the mutation request (not cancelled). The error that triggers `onError` comes from the mutation.
+- **Optimistic data is a guess.** It is not 100% synced with the server, and an error does not trigger a refetch by itself. I have to write the invalidation.
+- **`setQueryData` resets the freshness timer.** The optimistic data counts as fresh for the whole `staleTime`. I still need to work out the fix; `onSettled` invalidation is the likely answer.
 - **`invalidateQueries` does not belong in `onMutate`.** It triggers the refetch that `cancelQueries` is there to stop.
-- **Syntax slips:** the option is `queryKey` (not `key`), it is `setQueryData` (not `setQuery`), `onMutate`, `mutationFn` and `onSettled` are separate options on `useMutation` (not nested), and `cancelQueries` belongs in `onMutate`, not `onSettled`.
+- **Syntax slips:** the option is `queryKey` (not `key`), `onMutate`, `mutationFn`, `onError` and `onSettled` are separate options on `useMutation` (not nested), `var` is reserved so use `variables`, the arrow is `=>`, `cancelQueries` is awaited, and `onMutate` must `return` the snapshot or `context` is `undefined`.
 
 ## Still to do
-
-- Write the snapshot line (`getQueryData`) before `setQueryData` and return it from `onMutate`.
-- Practice `onError` rollback using `context`.
-- Work out how to handle the staleTime problem after an optimistic write.
+- Explain what `cancelQueries` inside `onError` protects against (open question).
+- Create, update and delete: temp IDs, list cache vs detail cache.
+- Concurrent mutations: races and rollback clobbering.
