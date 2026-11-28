@@ -2,9 +2,9 @@
 
 # TIL: Optimistic updates: cancel, snapshot, write, roll back, then invalidate
 
-**Date:** 2026-11-26
-**Covered in this session:** onMutate + cancelQueries, snapshot with getQueryData, optimistic write with setQueryData, onError rollback, onSettled invalidation (including the focus-refetch race), a full toggle-todo mutation, optimistic create with a temp id, list vs detail caches, optimistic delete, concurrent mutations, and a delete mutation for multi-shape (offset and cursor) caches
-**Explained but not yet tried:** the per-item multi-cache rollback, `mutationKey` + `isMutating` (the invalidate-when-last-delete-finishes pattern), `setQueriesData`, `removeQueries` for a deleted note's detail entry
+**Date:** 2026-11-28
+**Covered in this session:** onMutate + cancelQueries, snapshot with getQueryData, optimistic write with setQueryData, onError rollback, onSettled invalidation (including the focus-refetch race), a full toggle-todo mutation, optimistic create with a temp id, list vs detail caches, optimistic delete, concurrent mutations, delete and create for multi-shape (offset and cursor) caches
+**Explained but not yet tried:** the per-item multi-cache rollback, `mutationKey` + `isMutating` (invalidate only when the last delete finishes), `setQueriesData`, `removeQueries` for a deleted note's detail entry
 **Not covered yet:** a verified answer for the create-then-delete overlap, what saving the index buys the user
 
 ## Core idea
@@ -163,8 +163,9 @@ onError: (_error, _noteId, context) => {
 - Trace, cache `[A,B,C,D]`, delete A then B, A fails: A is saved at index 0, B is saved at index 0 (in `[B,C,D]`), and A's `onError` turns `[C,D]` into `[A,C,D]`. B stays removed, because `onError` inserts only A into the current cache. Sending B's request has no effect on this.
 - **Edge case, both fail:** B's saved index 0 was measured on `[B,C,D]`, but when B's `onError` runs, A is back at index 0, so the cache becomes `[B,A,C,D]`. An index is only correct for the list as it was when measured. The `onSettled` refetch replaces the whole list with the server's order and corrects it, so the index is a best effort for the moment in between.
 - The refetch only fires if a component is using the query, not just "if the user is active".
+- **Practical decision for my project:** a whole-snapshot rollback is acceptable for delete. The clobbering needs two overlapping mutations plus an early failure, and the damage is a brief flicker until the refetch. Per-item rollback over offset and cursor caches takes a lot of code for a rare case. Keep per-item for create (filter by temp id) and use the `mutationKey` + `isMutating` check to stop a stale refetch from flashing a deleted note back.
 
-### 10. Delete for multi-shape caches (code I wrote from a real project)
+### 10. Multi-shape caches (offset and cursor)
 
 ```ts
 const snapshots = queryClient.getQueriesData({ queryKey: notesKeys.lists() });
@@ -177,9 +178,10 @@ context.snapshots.forEach(([queryKey, data]) =>
 ```
 
 - `getQueriesData` reads by **key prefix** and returns `[queryKey, data]` pairs, so each cached list is restored under its exact key.
-- Offset and cursor caches have different shapes, so the updater needs a guard per shape and spreads instead of mutating.
+- Offset and cursor caches have different shapes (`items` plus `total`/`page`/`limit`/`totalPages`, or `pages` plus `pageParams`). The updater needs a guard per shape and must spread the **original** cached value (`{ ...oldData, items: ... }`), not a parsed copy, because `z.object` strips unknown keys by default.
 - **To check:** `setQueryData` writes to one **exact** key. If the real list keys have extra segments (page, filters), `setQueryData(notesKeys.lists(), ...)` points at a key with no data, and the `if (!oldData)` guard silently skips the optimistic removal. `setQueriesData` takes a filter and matches by prefix. If the note only vanishes after the refetch, this is the cause.
-- Restoring whole snapshots brings back the clobbering problem from section 9, which the refetch corrects with a brief flicker. This is a trade-off to choose on purpose.
+- **Create is harder than delete here.** Reviewing my create code found real bugs (see Gotchas). Optimistic create has to guess filters, sort order, page limits and cursor boundaries, which means copying the server's rules to the client. A reasonable rule is to insert only where the note obviously belongs (unfiltered, newest-first, first page) and let `onSettled` bring the rest. Skipping the optimistic insert on complicated lists is fine.
+- Validate input in the form before calling `mutate`, so invalid data never enters the cache.
 
 ### 11. Loading flags
 
@@ -205,11 +207,16 @@ context.snapshots.forEach(([queryKey, data]) =>
 - **Why B stays removed after A fails:** I wrote "because B's request has been fired". The real reason is that `onError` inserts only A into the _current_ cache and never overwrites B's removal.
 - **Whole-list snapshots clobber concurrent changes.** I first described the result as "the user sees nothing happen". The user actually sees A and B both disappear and then both reappear. My first create's `onError` restored `context.oldData` (a whole list), which has the same problem.
 - **Don't destructure `useQueryClient()`.** `const { cancelQueries, setQueryData } = useQueryClient()` pulls the methods off the client and loses their `this`. Call them as `queryClient.cancelQueries(...)`.
-- **Temp id sign:** I used `Date.now()` for the temp id, which is positive, so it would not be caught by `disabled={todo.id < 0}`.
+- **Temp id sign (twice):** I used `Date.now()` for the temp id, which is positive, so it is not caught by `disabled={todo.id < 0}`. I fixed it, then used `Date.now()` again in a later version, and also used it as a meaningless `userId`.
+- **Wrong cache shape in my multi-cache create:** the cursor branch wrote an array of pages as the whole query data (dropping `pageParams`), and the offset branch wrote a plain `Note[]` (dropping `total`, `page`, `limit`, `totalPages`). Always spread the original cached object, as the delete code does.
+- **I inserted the new note into every page.** A new note belongs only on the first page of a cursor cache or on page 1 of an offset cache. Inserting everywhere creates duplicates.
+- **Not every item in a code review is a real problem.** In a 15-point review, only the shape bugs, the every-page insert and the temp id were real. The others were design trade-offs (filters, sorts, page limits, whole-snapshot rollback) or not problems at all (fabricated temp note, invalidating all lists in `onSettled`).
 - **Syntax slips:** the option is `queryKey` (not `key`), it is `setQueryData` (not `setQuery`) and `invalidateQueries` (plural), `onMutate`, `mutationFn`, `onError` and `onSettled` are separate options on `useMutation` (not nested), `var` is reserved so use `variables`, the arrow is `=>`, `'todo'` in a key must be a string, `cancelQueries` is awaited, and `onMutate` must `return` its context or `context` is `undefined`.
 
 ## Still to do
 
+- Compare the cursor branch of my create code with the cursor branch of my delete code. What does delete spread that create leaves out, and what does the infinite query lose because of it? (open question)
+- Fix the multi-cache create: spread the original cached object, insert only on the first page, use a negative temp id, and decide which lists get the optimistic insert.
 - Trace create-then-delete: cache `[N,A,B,C,D]`, delete A, then N's request fails. What does the cache hold, and why does it work without a snapshot? (open question)
 - Answer: if the refetch fixes the order anyway, what does saving the index buy the user? (open question)
 - Check in the editor how TypeScript types `context.deletedNote` in `onError`, since `deletedNote` is assigned inside the updater callback and read after it.
